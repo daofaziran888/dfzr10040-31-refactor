@@ -29,6 +29,14 @@ from app.models import (
     WatermarkRecord,
     WideTableDef,
 )
+from app.verification import (
+    CHECK_KIND_CROSS_VALIDATE,
+    CHECK_KIND_QUALITY_GATE,
+    DriftDispatchQueue,
+    SnapshotReleaseRegistry,
+    VerificationCredential,
+    build_verification_credential,
+)
 
 
 def _now_iso() -> str:
@@ -60,6 +68,11 @@ class FusionEngine:
         self._cross_validates: dict[int, CrossValidatePlan] = {}
         self._drifts: dict[int, DataDriftRecord] = {}
         self._monitors: dict[int, FusionMonitorMetric] = {}
+        # 统一核验凭据：门禁与跨表校验共用同一份证据结构，按凭据编码检索。
+        self._credentials: dict[str, VerificationCredential] = {}
+        # 快照发布入口（凭据级幂等）与漂移调度队列，由统一凭据驱动交接。
+        self._release_registry = SnapshotReleaseRegistry(self._write_snapshot_for_release)
+        self._drift_queue = DriftDispatchQueue()
         self._next_id: int = 1
 
     def _next_seq(self) -> int:
@@ -573,6 +586,55 @@ class FusionEngine:
             "records": records,
         }
 
+    def run_cross_validation_check(self, plan_id: int,
+                                   input_version: str,
+                                   shared_input_id: str,
+                                   primary_records: list[dict[str, Any]] | None = None,
+                                   reference_records: list[dict[str, Any]] | None = None
+                                   ) -> dict[str, Any]:
+        """执行跨宽表校验并产出统一核验凭据。
+
+        校验方式与 ``execute_cross_validation`` 一致（按关联键对齐后逐字段
+        比对），报告保留原有的 mismatch_count / mismatches / drift_detected
+        字段；凭据与门禁凭据共用同一结构，靠 check_kind 区分。
+        """
+        plan = self._cross_validates.get(plan_id)
+        if plan is None:
+            return {"ok": False, "message": f"交叉校验方案 {plan_id} 不存在"}
+
+        if primary_records is None:
+            primary_job = self._find_fusion_job_by_table(plan.primary_wide_table)
+            primary_records = list(primary_job.merged_records) if primary_job else []
+        if reference_records is None:
+            ref_job = self._find_fusion_job_by_table(plan.reference_wide_table)
+            reference_records = list(ref_job.merged_records) if ref_job else []
+
+        diff = self._compute_cross_validation_diff(
+            plan, primary_records, reference_records,
+        )
+        report = {
+            "plan_code": plan.plan_code,
+            "validate_status": plan.validate_status,
+            "matched_keys": diff["matched_keys"],
+            "mismatch_count": diff["mismatch_count"],
+            "drift_detected": diff["drift_detected"],
+            "mismatches": diff["mismatches"],
+        }
+
+        credential = self._issue_credential(
+            check_kind=CHECK_KIND_CROSS_VALIDATE,
+            wide_table=plan.primary_wide_table,
+            input_version=input_version,
+            shared_input_id=shared_input_id,
+            records=primary_records,
+            report=report,
+            status=plan.validate_status,
+        )
+        result = dict(report)
+        result["ok"] = True
+        result["credential"] = self._credential_payload(credential)
+        return result
+
     def execute_cross_validation(self, plan_id: int) -> dict[str, Any]:
         """执行跨宽表交叉校验，检测数据一致性偏差。"""
         plan = self._cross_validates.get(plan_id)
@@ -585,6 +647,39 @@ class FusionEngine:
         primary_records = primary_job.merged_records if primary_job else []
         ref_records = ref_job.merged_records if ref_job else []
 
+        diff = self._compute_cross_validation_diff(plan, primary_records, ref_records)
+        plan.validate_status = "偏差告警" if diff["mismatches"] else "一致"
+        plan.last_result = json.dumps({
+            "matched_keys": diff["matched_keys"],
+            "mismatch_count": diff["mismatch_count"],
+            "drift_detected": diff["drift_detected"],
+        }, ensure_ascii=False)
+
+        result: dict[str, Any] = {
+            "ok": True,
+            "plan_code": plan.plan_code,
+            "validate_status": plan.validate_status,
+            "mismatch_count": diff["mismatch_count"],
+            "drift_detected": diff["drift_detected"],
+            "mismatches": diff["mismatches"],
+        }
+
+        if diff["drift_detected"]:
+            drift_record = self.create_drift_record(
+                wide_table_name=plan.primary_wide_table,
+                drift_type="schema_mismatch",
+                historical_baseline="baseline_" + _now_iso(),
+                current_distribution="current_" + _now_iso(),
+            )
+            result["drift_record_code"] = drift_record.record_code
+
+        return result
+
+    def _compute_cross_validation_diff(self, plan: CrossValidatePlan,
+                                       primary_records: list[dict[str, Any]],
+                                       ref_records: list[dict[str, Any]]
+                                       ) -> dict[str, Any]:
+        """跨表差异比对：原校验方式不变，差异计数与明细结构不变。"""
         primary_by_key = {str(r.get(plan.join_key, "")): r for r in primary_records}
         ref_by_key = {str(r.get(plan.join_key, "")): r for r in ref_records}
 
@@ -604,32 +699,12 @@ class FusionEngine:
                     })
                     drift_detected = True
 
-        plan.validate_status = "偏差告警" if mismatches else "一致"
-        plan.last_result = json.dumps({
+        return {
             "matched_keys": len(set(primary_by_key.keys()) & set(ref_by_key.keys())),
-            "mismatch_count": len(mismatches),
-            "drift_detected": drift_detected,
-        }, ensure_ascii=False)
-
-        result: dict[str, Any] = {
-            "ok": True,
-            "plan_code": plan.plan_code,
-            "validate_status": plan.validate_status,
             "mismatch_count": len(mismatches),
             "drift_detected": drift_detected,
             "mismatches": mismatches[:20],
         }
-
-        if drift_detected:
-            drift_record = self.create_drift_record(
-                wide_table_name=plan.primary_wide_table,
-                drift_type="schema_mismatch",
-                historical_baseline="baseline_" + _now_iso(),
-                current_distribution="current_" + _now_iso(),
-            )
-            result["drift_record_code"] = drift_record.record_code
-
-        return result
 
     def reconcile_partition_archive(self, partition_rule_id: int,
                                     cold_strategy_id: int) -> dict[str, Any]:
@@ -743,6 +818,195 @@ class FusionEngine:
             "group_dimensions": group_dimensions,
         }
 
+    # ---- 统一核验凭据与交接协调 ----
+
+    def _issue_credential(self, *, check_kind: str, wide_table: str,
+                          input_version: str, shared_input_id: str,
+                          records: list[dict[str, Any]], report: dict[str, Any],
+                          status: str) -> VerificationCredential:
+        """通过统一证据装配入口签发凭据并登记到引擎凭据簿。"""
+        credential = build_verification_credential(
+            check_kind=check_kind,
+            wide_table=wide_table,
+            input_version=input_version,
+            shared_input_id=shared_input_id,
+            records=records,
+            report=report,
+            status=status,
+            sequence=len(self._credentials) + 1,
+        )
+        self._credentials[credential.credential_code] = credential
+        return credential
+
+    @staticmethod
+    def _credential_payload(credential: VerificationCredential) -> dict[str, Any]:
+        """对外凭据视图：交接身份四要素与完整报告一并可读。"""
+        payload = credential.handoff_identity()
+        payload.update({
+            "credential_code": credential.credential_code,
+            "row_count": credential.row_count,
+            "status": credential.status,
+            "created_at": credential.created_at,
+            "report": dict(credential.report),
+        })
+        return payload
+
+    def get_credential(self, credential_code: str) -> dict[str, Any] | None:
+        credential = self._credentials.get(credential_code)
+        return self._credential_payload(credential) if credential else None
+
+    def _require_credential(self, credential_code: str,
+                            expected_kind: str | None = None
+                            ) -> VerificationCredential | None:
+        credential = self._credentials.get(credential_code)
+        if credential is None or (
+            expected_kind is not None and credential.check_kind != expected_kind
+        ):
+            return None
+        return credential
+
+    def request_snapshot_release(self, credential_code: str,
+                                 partition_key_value: str,
+                                 worker: str = "worker-0") -> dict[str, Any]:
+        """门禁通过后向发布入口登记快照写入请求（回执未返回前不真正写入）。"""
+        credential = self._require_credential(credential_code, CHECK_KIND_QUALITY_GATE)
+        if credential is None:
+            return {"ok": False, "message": f"核验凭据 {credential_code} 不存在或不是门禁凭据"}
+        entry, created, reason = self._release_registry.request_release(
+            credential, partition_key_value, worker,
+        )
+        return {
+            "ok": True,
+            "release_code": entry.release_code,
+            "credential_code": entry.credential_code,
+            "status": entry.status,
+            "created": created,
+            "reason": reason,
+            "attempts": len(entry.attempts),
+        }
+
+    def reclaim_snapshot_release(self, credential_code: str,
+                                 worker: str = "worker-reclaim") -> dict[str, Any]:
+        """作业超时重新领取：返回暂缓状态，不产生新的快照写入。"""
+        entry, accepted, reason = self._release_registry.reclaim(credential_code, worker)
+        if entry is None:
+            return {"ok": False, "message": f"核验凭据 {credential_code} 无对应发布登记"}
+        return {
+            "ok": True,
+            "release_code": entry.release_code,
+            "credential_code": entry.credential_code,
+            "status": entry.status,
+            "accepted": accepted,
+            "reason": reason,
+            "snapshot_code": entry.snapshot_code,
+            "attempts": len(entry.attempts),
+        }
+
+    def redeliver_snapshot_release(self, credential_code: str,
+                                   worker: str = "worker-redeliver") -> dict[str, Any]:
+        """旧凭据被另一工作进程重投：幂等去重，不产生新的快照写入。"""
+        entry, accepted, reason = self._release_registry.redeliver(credential_code, worker)
+        if entry is None:
+            return {"ok": False, "message": f"核验凭据 {credential_code} 无对应发布登记"}
+        return {
+            "ok": True,
+            "release_code": entry.release_code,
+            "credential_code": entry.credential_code,
+            "status": entry.status,
+            "accepted": accepted,
+            "reason": reason,
+            "snapshot_code": entry.snapshot_code,
+            "attempts": len(entry.attempts),
+        }
+
+    def confirm_snapshot_receipt(self, credential_code: str,
+                                 worker: str = "publisher") -> dict[str, Any]:
+        """放开发布回执：真实快照写入在此刻发生且只发生一次。"""
+        entry, accepted, reason = self._release_registry.confirm_receipt(
+            credential_code, worker,
+        )
+        if entry is None:
+            return {"ok": False, "message": f"核验凭据 {credential_code} 无对应发布登记"}
+        return {
+            "ok": accepted,
+            "release_code": entry.release_code,
+            "credential_code": entry.credential_code,
+            "status": entry.status,
+            "reason": reason,
+            "snapshot_code": entry.snapshot_code,
+            "record_count": entry.record_count,
+            "attempts": len(entry.attempts),
+        }
+
+    def _write_snapshot_for_release(self, entry: Any) -> str:
+        """发布回执放开时的唯一真实快照写入口。"""
+        snap = self.create_snapshot(
+            target_wide_table=entry.wide_table,
+            partition_key_value=entry.partition_key_value,
+        )
+        snap.record_count = entry.record_count
+        snap.status_mark = "可用"
+        return snap.partition_code
+
+    def handoff_drift(self, credential_code: str) -> dict[str, Any]:
+        """凭跨表校验凭据发起漂移处置交接（初始为待交接确认）。"""
+        credential = self._require_credential(credential_code, CHECK_KIND_CROSS_VALIDATE)
+        if credential is None:
+            return {"ok": False, "message": f"核验凭据 {credential_code} 不存在或不是交叉校验凭据"}
+        todo = self._drift_queue.handoff(credential)
+        return self._drift_todo_payload(todo)
+
+    def confirm_drift_handoff(self, credential_code: str) -> dict[str, Any]:
+        """确认该版本可独立发起漂移处置，调度队列方可领取。"""
+        todo = self._drift_queue.confirm_handoff(credential_code)
+        if todo is None:
+            return {"ok": False, "message": f"核验凭据 {credential_code} 无对应漂移交接"}
+        return self._drift_todo_payload(todo)
+
+    def claim_drift_dispatch(self, worker: str = "dispatcher-0") -> dict[str, Any]:
+        """漂移调度只领取本次交接已确认可处理的版本。"""
+        todo = self._drift_queue.claim_dispatch(worker)
+        if todo is None:
+            return {"ok": True, "claimed": False, "message": "没有已确认交接的可调度漂移待办"}
+        payload = self._drift_todo_payload(todo)
+        payload["claimed"] = True
+        return payload
+
+    def submit_correction(self, new_credential_code: str) -> dict[str, Any]:
+        """提交更正比对凭据：原差异消失则撤销待办，原差异保留供追查。"""
+        credential = self._require_credential(new_credential_code, CHECK_KIND_CROSS_VALIDATE)
+        if credential is None:
+            return {"ok": False, "message": f"核验凭据 {new_credential_code} 不存在或不是交叉校验凭据"}
+        todo, revoked, reason = self._drift_queue.submit_correction(credential)
+        if todo is None:
+            return {"ok": False, "message": "没有可撤销的漂移待办", "reason": reason}
+        payload = self._drift_todo_payload(todo)
+        payload["revoked"] = revoked
+        payload["reason"] = reason
+        return payload
+
+    def get_drift_todo(self, credential_code: str) -> dict[str, Any] | None:
+        todo = self._drift_queue.get_todo(credential_code)
+        return self._drift_todo_payload(todo) if todo else None
+
+    @staticmethod
+    def _drift_todo_payload(todo: Any) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "todo_code": todo.todo_code,
+            "credential_code": todo.credential_code,
+            "wide_table": todo.wide_table,
+            "input_version": todo.input_version,
+            "shared_input_id": todo.shared_input_id,
+            "check_value": todo.check_value,
+            "status": todo.status,
+            "handoff_confirmed": todo.handoff_confirmed,
+            "revoked_by_credential": todo.revoked_by_credential,
+            # 原始差异证据始终保留，撤销后仍可追查。
+            "original_report": dict(todo.original_report),
+            "handling_records": [dict(item) for item in todo.handling_records],
+        }
+
     # ---- 辅助方法 ----
 
     def _find_source_by_code(self, source_code: str) -> SourceDef | None:
@@ -822,9 +1086,60 @@ class FusionEngine:
             "resolved": resolved,
         }
 
+    def run_quality_gate_check(self, target_wide_table: str,
+                               input_version: str,
+                               shared_input_id: str,
+                               records: list[dict[str, Any]] | None = None,
+                               gate_rule_id: int | None = None
+                               ) -> dict[str, Any]:
+        """对指定宽表版本执行门禁检查，并产出统一核验凭据。
+
+        校验方式与 ``_apply_quality_gates`` 完全一致（row_count_min /
+        null_check），报告保留原有的 passed / gates_checked / violations
+        字段；凭据额外承载检查类型、输入版本、共享输入身份与校验值。
+        """
+        if records is None:
+            job = self._find_fusion_job_by_table(target_wide_table)
+            records = list(job.merged_records) if job else []
+
+        if gate_rule_id is not None:
+            gate = self._quality_gates.get(gate_rule_id)
+            gates = [gate] if gate is not None and gate.target_wide_table == target_wide_table else []
+        else:
+            gates = [
+                g for g in self._quality_gates.values()
+                if g.target_wide_table == target_wide_table
+            ]
+
+        report: dict[str, Any]
+        if not gates:
+            report = {"passed": True, "gates_checked": 0, "violations": []}
+        else:
+            violations: list[dict[str, Any]] = []
+            for gate in gates:
+                violations.extend(self._evaluate_quality_gate(gate, records))
+            report = {
+                "passed": len(violations) == 0,
+                "gates_checked": len(gates),
+                "violations": violations,
+            }
+
+        credential = self._issue_credential(
+            check_kind=CHECK_KIND_QUALITY_GATE,
+            wide_table=target_wide_table,
+            input_version=input_version,
+            shared_input_id=shared_input_id,
+            records=records,
+            report=report,
+            status="通过" if report["passed"] else "阻断",
+        )
+        result = dict(report)
+        result["credential"] = self._credential_payload(credential)
+        return result
+
     def _apply_quality_gates(self, records: list[dict[str, Any]],
                              target_wide_table: str) -> dict[str, Any]:
-        """应用质量门禁检查。"""
+        """应用质量门禁检查（流水线内部入口，字段与行为保持不变）。"""
         gates = [
             g for g in self._quality_gates.values()
             if g.target_wide_table == target_wide_table
@@ -834,25 +1149,38 @@ class FusionEngine:
 
         violations: list[dict[str, Any]] = []
         for gate in gates:
-            gate.checked_rows = len(records)
-            if gate.check_type == "row_count_min" and len(records) < int(gate.threshold_condition):
-                violations.append({"rule_code": gate.rule_code, "check": "row_count_min",
-                                   "actual": len(records), "threshold": gate.threshold_condition})
-            elif gate.check_type == "null_check":
-                null_count = sum(
-                    1 for rec in records
-                    if rec.get(gate.threshold_condition) is None
-                )
-                if null_count > 0:
-                    violations.append({"rule_code": gate.rule_code, "check": "null_check",
-                                       "null_count": null_count})
+            violations.extend(self._evaluate_quality_gate(gate, records))
+        return {
+            "passed": len(violations) == 0,
+            "gates_checked": len(gates),
+            "violations": violations,
+        }
 
-        passed = len(violations) == 0
-        return {"passed": passed, "gates_checked": len(gates), "violations": violations}
+    def _evaluate_quality_gate(self, gate: QualityGateRule,
+                               records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """单条门禁规则求值：原校验方式不变，违例明细结构不变。"""
+        gate.checked_rows = len(records)
+        violations: list[dict[str, Any]] = []
+        if gate.check_type == "row_count_min" and len(records) < int(gate.threshold_condition):
+            violations.append({"rule_code": gate.rule_code, "check": "row_count_min",
+                               "actual": len(records), "threshold": gate.threshold_condition})
+        elif gate.check_type == "null_check":
+            null_count = sum(
+                1 for rec in records
+                if rec.get(gate.threshold_condition) is None
+            )
+            if null_count > 0:
+                violations.append({"rule_code": gate.rule_code, "check": "null_check",
+                                   "null_count": null_count})
+        return violations
 
     @staticmethod
     def _make_merge_key(record: dict[str, Any], join_key: str) -> str:
         return f"{record.get('_source', '_')}#{record.get(join_key, '_')}"
+
+    def list_snapshots(self) -> list[SnapshotPartition]:
+        """只读列出当前引擎内的真实快照记录。"""
+        return list(self._snapshots.values())
 
     def domain_snapshot(self) -> dict[str, Any]:
         """输出引擎全局数据质量快照。"""
